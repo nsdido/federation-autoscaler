@@ -27,7 +27,20 @@ import (
 // conformanceFreshFor is the freshness window the shared specs use. It is a
 // real window and the staleness spec really waits, because a key-value
 // backend expires keys on its own clock and no fake clock can move it.
-const conformanceFreshFor = 100 * time.Millisecond
+//
+// It has to be comfortably longer than one second. A backend that stores the
+// timestamp in a serialised form keeps it at second granularity — the
+// Kubernetes API encodes metav1.Time as RFC 3339 with no fraction, and Redis
+// key expiry is also whole seconds — so a just-written entry can read back as
+// up to a second old. With a sub-second window every backend but the in-memory
+// one would report a brand new offer as already stale. The real window in the
+// broker is ninety seconds, so this is the same shape, only smaller.
+const conformanceFreshFor = 2 * time.Second
+
+// staleWait is how long the specs wait to push an entry past the window: the
+// window itself, plus the one second a truncated timestamp can hide, plus a
+// margin.
+const staleWait = conformanceFreshFor + 1500*time.Millisecond
 
 // RunOfferStoreConformance defines the behaviour every OfferStore must have,
 // whatever it stores the catalog in. Call it once per implementation; if a
@@ -113,7 +126,7 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
 		Expect(err).NotTo(HaveOccurred())
 
-		time.Sleep(conformanceFreshFor + 50*time.Millisecond)
+		time.Sleep(staleWait)
 
 		// GetOffer still finds it: going stale is not the same as being
 		// deleted, and the entry stays in the catalog.
@@ -134,7 +147,7 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
 		Expect(err).NotTo(HaveOccurred())
 
-		time.Sleep(conformanceFreshFor + 50*time.Millisecond)
+		time.Sleep(staleWait)
 
 		stored, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
 		Expect(err).NotTo(HaveOccurred())
