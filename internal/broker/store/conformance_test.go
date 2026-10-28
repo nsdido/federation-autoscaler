@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -49,13 +50,19 @@ const staleWait = conformanceFreshFor + 1500*time.Millisecond
 // newStore must return a fresh, empty store using the given freshness window.
 func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) {
 	var (
-		ctx context.Context
-		s   OfferStore
+		ctx    context.Context
+		s      OfferStore
+		chunks ChunkStore
 	)
 
 	BeforeEach(func() {
 		ctx = context.Background()
 		s = newStore(conformanceFreshFor)
+
+		var ok bool
+		chunks, ok = s.(ChunkStore)
+		Expect(ok).To(BeTrue(),
+			"every catalog implementation must also implement ChunkStore")
 	})
 
 	It("returns what was stored", func() {
@@ -158,6 +165,201 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		Expect(fresh).To(HaveLen(1))
 	})
 
+	// -------------------------------------------------------------------
+	// reservation counters
+	// -------------------------------------------------------------------
+
+	It("consumes chunks and reports what is left", func() {
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a")) // 4 chunks
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, available, err := chunks.TryConsumeChunks(ctx, "cluster-a", 3)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+		Expect(available).To(Equal(int32(1)))
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.ReservedChunks).To(Equal(int32(3)))
+		Expect(got.AvailableChunks()).To(Equal(int32(1)))
+	})
+
+	It("allows consuming exactly what is left", func() {
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, available, err := chunks.TryConsumeChunks(ctx, "cluster-a", 4)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+		Expect(available).To(BeZero())
+	})
+
+	It("refuses more chunks than are available, and changes nothing", func() {
+		// The point of the rule is the second half. A refusal that still
+		// wrote something would leave capacity lost with no reservation
+		// holding it.
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, available, err := chunks.TryConsumeChunks(ctx, "cluster-a", 5)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeFalse())
+		Expect(available).To(Equal(int32(4)))
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.ReservedChunks).To(BeZero())
+	})
+
+	It("releases chunks back", func() {
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, _, err := chunks.TryConsumeChunks(ctx, "cluster-a", 3)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+
+		Expect(chunks.ReleaseChunks(ctx, "cluster-a", 2)).To(Succeed())
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.ReservedChunks).To(Equal(int32(1)))
+		Expect(got.AvailableChunks()).To(Equal(int32(3)))
+	})
+
+	It("never lets the counter go below zero when too much is released", func() {
+		// A release that runs twice must not leave a provider looking as
+		// if it had more capacity than it owns.
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, _, err := chunks.TryConsumeChunks(ctx, "cluster-a", 1)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+
+		Expect(chunks.ReleaseChunks(ctx, "cluster-a", 1)).To(Succeed())
+		Expect(chunks.ReleaseChunks(ctx, "cluster-a", 1)).To(Succeed())
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.ReservedChunks).To(BeZero())
+		Expect(got.AvailableChunks()).To(Equal(int32(4)))
+	})
+
+	It("returns ErrNotFound when the provider never advertised", func() {
+		_, _, err := chunks.TryConsumeChunks(ctx, "nobody", 1)
+		Expect(err).To(MatchError(ErrNotFound))
+
+		Expect(chunks.ReleaseChunks(ctx, "nobody", 1)).To(MatchError(ErrNotFound))
+	})
+
+	It("rejects a count that is not positive", func() {
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		_, _, err = chunks.TryConsumeChunks(ctx, "cluster-a", 0)
+		Expect(err).To(MatchError(ErrInvalidCount))
+
+		_, _, err = chunks.TryConsumeChunks(ctx, "cluster-a", -1)
+		Expect(err).To(MatchError(ErrInvalidCount))
+
+		Expect(chunks.ReleaseChunks(ctx, "cluster-a", 0)).To(MatchError(ErrInvalidCount))
+		Expect(chunks.ReleaseChunks(ctx, "cluster-a", -1)).To(MatchError(ErrInvalidCount))
+	})
+
+	It("carries the previous ReservedChunks over on upsert", func() {
+		// The provider's own heartbeat arrives every thirty seconds. If it
+		// could write this counter, every heartbeat would free chunks that
+		// are still held and they would be sold twice.
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		ok, _, err := chunks.TryConsumeChunks(ctx, "cluster-a", 3)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ok).To(BeTrue())
+
+		again := sampleOffer("cluster-a")
+		again.ReservedChunks = 0 // what an advertisement always sends
+		stored, err := s.UpsertOffer(ctx, again)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stored.ReservedChunks).To(Equal(int32(3)))
+		Expect(stored.AvailableChunks()).To(Equal(int32(1)))
+	})
+
+	It("never sells the same chunk twice to concurrent callers", func() {
+		// This is the rule the whole interface exists for. Eight callers
+		// ask for one chunk each at the same moment, against an offer
+		// worth four: exactly four may be told yes.
+		_, err := s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		const callers = 8
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			granted int
+			failed  error
+		)
+
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ok, _, err := chunks.TryConsumeChunks(ctx, "cluster-a", 1)
+
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil && failed == nil {
+					failed = err
+				}
+				if ok {
+					granted++
+				}
+			}()
+		}
+		wg.Wait()
+
+		Expect(failed).NotTo(HaveOccurred())
+		Expect(granted).To(Equal(4))
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.ReservedChunks).To(Equal(int32(4)))
+		Expect(got.AvailableChunks()).To(BeZero())
+	})
+
+	It("keeps extra fields it does not understand", func() {
+		// A provider may send things the catalog never defined. The store
+		// has to carry them untouched, or the first provider with its own
+		// field silently loses it.
+		o := sampleOffer("cluster-a")
+		o.Extra = map[string]string{"gpuModel": "A100", "rackUnit": "7"}
+
+		_, err := s.UpsertOffer(ctx, o)
+		Expect(err).NotTo(HaveOccurred())
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Extra).To(Equal(map[string]string{"gpuModel": "A100", "rackUnit": "7"}))
+	})
+
+	It("drops extra fields when a later advertisement omits them", func() {
+		// The provider is the source of truth for its own offer, so an
+		// advertisement without a field removes it, exactly as it does for
+		// the fields the catalog does define.
+		first := sampleOffer("cluster-a")
+		first.Extra = map[string]string{"gpuModel": "A100"}
+		_, err := s.UpsertOffer(ctx, first)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = s.UpsertOffer(ctx, sampleOffer("cluster-a"))
+		Expect(err).NotTo(HaveOccurred())
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got.Extra).To(BeEmpty())
+	})
+
 	It("filters by cluster type", func() {
 		std := sampleOffer("cluster-a")
 		gpu := sampleOffer("cluster-b")
@@ -201,12 +403,6 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		Expect(again.Resources[0].Name).To(Equal("cpu"))
 		Expect(*again.CarbonIntensity).To(BeNumerically("==", 120))
 	})
-
-	// Pending until the reservation side of the Store exists. The rule is
-	// that an upsert carries the previous ReservedChunks over, which cannot
-	// be set up through the catalog methods alone: nothing here can put a
-	// non-zero value in the counter.
-	PIt("carries the previous ReservedChunks over on upsert", func() {})
 }
 
 // sampleOffer is a complete, valid offer used across the specs.

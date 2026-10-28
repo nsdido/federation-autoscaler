@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -51,7 +52,7 @@ func NewCRStore(c client.Client, namespace string, freshFor time.Duration) *CRSt
 	return &CRStore{client: c, namespace: namespace, freshFor: freshFor, now: time.Now}
 }
 
-var _ OfferStore = (*CRStore)(nil)
+var _ Store = (*CRStore)(nil)
 
 // UpsertOffer writes the spec, then refreshes the status.
 //
@@ -75,7 +76,7 @@ func (s *CRStore) UpsertOffer(ctx context.Context, o Offer) (Offer, error) {
 
 	if _, err := controllerutil.CreateOrUpdate(ctx, s.client, cadv, func() error {
 		cadv.Spec = spec
-		return nil
+		return setExtraAnnotation(cadv, o.Extra)
 	}); err != nil {
 		return Offer{}, fmt.Errorf("store: upsert %s/%s: %w", s.namespace, o.ClusterID, err)
 	}
@@ -94,8 +95,13 @@ func (s *CRStore) UpsertOffer(ctx context.Context, o Offer) (Offer, error) {
 		patch.Status.AvailableChunks = 0
 	}
 
+	// The spec landed above, so the offer IS in the catalog even if this
+	// second write fails. Say so with ErrPartialWrite and still return the
+	// offer, so a caller that can live with a stale stamp does not have to
+	// treat it as a lost advertisement.
 	if err := s.client.Status().Update(ctx, patch); err != nil {
-		return Offer{}, fmt.Errorf("store: status update %s/%s: %w", s.namespace, o.ClusterID, err)
+		return s.offerFromCR(patch),
+			fmt.Errorf("%w: %s/%s: %w", ErrPartialWrite, s.namespace, o.ClusterID, err)
 	}
 
 	return s.offerFromCR(patch), nil
@@ -134,6 +140,117 @@ func (s *CRStore) ListOffers(ctx context.Context, f OfferFilter) ([]Offer, error
 		out = append(out, o)
 	}
 	return out, nil
+}
+
+// -----------------------------------------------------------------------------
+// reservation counters
+// -----------------------------------------------------------------------------
+
+// crCounterAttempts bounds the read-check-write loop below.
+//
+// Kubernetes refuses a write when the object changed since it was read, so a
+// loser retries with the new value instead of overwriting it. The bound is
+// generous because every retry means another caller succeeded, which is the
+// loop working, not failing; it is here only so a pathological case ends with
+// an error rather than spinning forever.
+const crCounterAttempts = 20
+
+// TryConsumeChunks takes count chunks if that many are available.
+//
+// This is the same read-check-write loop the reservation path already uses on
+// this custom resource, moved behind the interface unchanged. Its safety does
+// not come from the loop but from the API server: the write carries the
+// version the object had when it was read, and is rejected if anything else
+// wrote in between. Without that rejection, two callers reading "4 available"
+// at the same moment would both be allowed to take 4.
+func (s *CRStore) TryConsumeChunks(ctx context.Context, clusterID string, count int32) (bool, int32, error) {
+	if count <= 0 {
+		return false, 0, fmt.Errorf("%w: got %d", ErrInvalidCount, count)
+	}
+
+	key := types.NamespacedName{Name: clusterID, Namespace: s.namespace}
+
+	for attempt := 0; ; attempt++ {
+		var cadv brokerv1alpha1.ClusterAdvertisement
+		if err := s.client.Get(ctx, key, &cadv); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, 0, ErrNotFound
+			}
+			return false, 0, fmt.Errorf("store: get %s/%s: %w", s.namespace, clusterID, err)
+		}
+
+		available := availableChunks(cadv.Status.TotalChunks, cadv.Status.ReservedChunks)
+		if available < count {
+			// Return before writing anything: a refused reservation
+			// must leave the advertisement exactly as it was.
+			return false, available, nil
+		}
+
+		cadv.Status.ReservedChunks += count
+		cadv.Status.AvailableChunks = availableChunks(cadv.Status.TotalChunks, cadv.Status.ReservedChunks)
+
+		err := s.client.Status().Update(ctx, &cadv)
+		if err == nil {
+			return true, cadv.Status.AvailableChunks, nil
+		}
+		if !apierrors.IsConflict(err) || attempt >= crCounterAttempts {
+			return false, 0, fmt.Errorf("store: consume %d chunks from %s/%s: %w",
+				count, s.namespace, clusterID, err)
+		}
+		// Somebody else wrote first. Read again and decide on their
+		// numbers, never on ours.
+		time.Sleep(crCounterBackoff(attempt))
+	}
+}
+
+// ReleaseChunks gives count chunks back, never going below zero.
+func (s *CRStore) ReleaseChunks(ctx context.Context, clusterID string, count int32) error {
+	if count <= 0 {
+		return fmt.Errorf("%w: got %d", ErrInvalidCount, count)
+	}
+
+	key := types.NamespacedName{Name: clusterID, Namespace: s.namespace}
+
+	for attempt := 0; ; attempt++ {
+		var cadv brokerv1alpha1.ClusterAdvertisement
+		if err := s.client.Get(ctx, key, &cadv); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ErrNotFound
+			}
+			return fmt.Errorf("store: get %s/%s: %w", s.namespace, clusterID, err)
+		}
+
+		cadv.Status.ReservedChunks -= count
+		if cadv.Status.ReservedChunks < 0 {
+			cadv.Status.ReservedChunks = 0
+		}
+		cadv.Status.AvailableChunks = availableChunks(cadv.Status.TotalChunks, cadv.Status.ReservedChunks)
+
+		err := s.client.Status().Update(ctx, &cadv)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(err) || attempt >= crCounterAttempts {
+			return fmt.Errorf("store: release %d chunks to %s/%s: %w",
+				count, s.namespace, clusterID, err)
+		}
+		time.Sleep(crCounterBackoff(attempt))
+	}
+}
+
+// crCounterBackoff grows the pause between retries a little each time, so a
+// burst of callers spreads out instead of colliding again immediately.
+func crCounterBackoff(attempt int) time.Duration {
+	return time.Duration(attempt+1) * 2 * time.Millisecond
+}
+
+// availableChunks is the same arithmetic as Offer.AvailableChunks, on the
+// numbers as the custom resource holds them.
+func availableChunks(total, reserved int32) int32 {
+	if n := total - reserved; n > 0 {
+		return n
+	}
+	return 0
 }
 
 // -----------------------------------------------------------------------------
@@ -221,6 +338,7 @@ func (s *CRStore) offerFromCR(cadv *brokerv1alpha1.ClusterAdvertisement) Offer {
 		Renewable:       cadv.Spec.Renewable,
 		TotalChunks:     cadv.Status.TotalChunks,
 		ReservedChunks:  cadv.Status.ReservedChunks,
+		Extra:           extraFromAnnotations(cadv),
 	}
 
 	if cadv.Spec.CarbonForecast != nil {
@@ -231,6 +349,48 @@ func (s *CRStore) offerFromCR(cadv *brokerv1alpha1.ClusterAdvertisement) Offer {
 		o.Fresh = s.now().Sub(o.LastSeen) <= s.freshFor
 	}
 	return o
+}
+
+// extraAnnotation is where fields the catalog does not define are kept.
+//
+// They live in an annotation rather than in the spec for one reason: carrying
+// them needs no change to the custom resource definition, so nothing outside
+// this package has to move. And they go in ONE annotation holding encoded
+// text rather than one annotation per key, because Kubernetes restricts what
+// an annotation name may look like and a provider's key names are not ours
+// to constrain.
+const extraAnnotation = "store.federation-autoscaler.io/extra"
+
+func setExtraAnnotation(cadv *brokerv1alpha1.ClusterAdvertisement, extra map[string]string) error {
+	if len(extra) == 0 {
+		delete(cadv.Annotations, extraAnnotation)
+		return nil
+	}
+	blob, err := json.Marshal(extra)
+	if err != nil {
+		return fmt.Errorf("store: encode extra fields: %w", err)
+	}
+	if cadv.Annotations == nil {
+		cadv.Annotations = map[string]string{}
+	}
+	cadv.Annotations[extraAnnotation] = string(blob)
+	return nil
+}
+
+// extraFromAnnotations reads them back. A value that cannot be decoded is
+// treated as absent rather than as an error: it is data this package never
+// interprets, the provider's next advertisement overwrites it thirty seconds
+// later, and failing a catalog read over it would be worse than losing it.
+func extraFromAnnotations(cadv *brokerv1alpha1.ClusterAdvertisement) map[string]string {
+	blob := cadv.Annotations[extraAnnotation]
+	if blob == "" {
+		return nil
+	}
+	var extra map[string]string
+	if err := json.Unmarshal([]byte(blob), &extra); err != nil {
+		return nil
+	}
+	return extra
 }
 
 // resourcesFromCR folds the CR's four per-resource maps back into one slice,

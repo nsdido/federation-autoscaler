@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -44,7 +45,7 @@ func NewMemoryStore(freshFor time.Duration) *MemoryStore {
 	}
 }
 
-var _ OfferStore = (*MemoryStore)(nil)
+var _ Store = (*MemoryStore)(nil)
 
 // UpsertOffer records the offer and stamps LastSeen.
 func (m *MemoryStore) UpsertOffer(_ context.Context, o Offer) (Offer, error) {
@@ -101,6 +102,57 @@ func (m *MemoryStore) ListOffers(_ context.Context, f OfferFilter) ([]Offer, err
 	return out, nil
 }
 
+// TryConsumeChunks takes count chunks if that many are available.
+//
+// Deciding and recording happen under the same lock, which is what makes the
+// decision trustworthy: no second caller can slip between the check and the
+// increment and be told the same chunks are free.
+func (m *MemoryStore) TryConsumeChunks(_ context.Context, clusterID string, count int32) (bool, int32, error) {
+	if count <= 0 {
+		return false, 0, fmt.Errorf("%w: got %d", ErrInvalidCount, count)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	o, ok := m.offers[clusterID]
+	if !ok {
+		return false, 0, ErrNotFound
+	}
+
+	if o.AvailableChunks() < count {
+		// Nothing is written: a refused reservation must leave the
+		// provider exactly as it was.
+		return false, o.AvailableChunks(), nil
+	}
+
+	o.ReservedChunks += count
+	m.offers[clusterID] = o
+	return true, o.AvailableChunks(), nil
+}
+
+// ReleaseChunks gives count chunks back, never going below zero.
+func (m *MemoryStore) ReleaseChunks(_ context.Context, clusterID string, count int32) error {
+	if count <= 0 {
+		return fmt.Errorf("%w: got %d", ErrInvalidCount, count)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	o, ok := m.offers[clusterID]
+	if !ok {
+		return ErrNotFound
+	}
+
+	o.ReservedChunks -= count
+	if o.ReservedChunks < 0 {
+		o.ReservedChunks = 0
+	}
+	m.offers[clusterID] = o
+	return nil
+}
+
 // view returns the caller's copy of a stored offer, with Fresh computed.
 // Callers get a copy so they cannot reach back into the store's state by
 // holding on to a slice or a pointer. A real backend serialises, which has
@@ -127,6 +179,12 @@ func cloneOffer(o Offer) Offer {
 		c.Resources = make([]Resource, len(o.Resources))
 		for i, r := range o.Resources {
 			c.Resources[i] = cloneResource(r)
+		}
+	}
+	if o.Extra != nil {
+		c.Extra = make(map[string]string, len(o.Extra))
+		for k, v := range o.Extra {
+			c.Extra[k] = v
 		}
 	}
 	return c

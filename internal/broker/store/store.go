@@ -70,6 +70,16 @@ type Offer struct {
 	// input, and it is not stored as a field; each backend decides how to
 	// answer it.
 	Fresh bool
+
+	// Extra carries whatever a provider sent that the catalog does not
+	// define. The store keeps these fields and hands them back unchanged:
+	// it never looks inside them, never filters on them, and never fails
+	// because of what they contain. Nil and empty mean the same thing.
+	//
+	// It is a map of strings rather than free-form JSON so that every
+	// backend can hold it natively. A provider with genuinely shapeless
+	// data can still put it under one key as its own encoded text.
+	Extra map[string]string
 }
 
 // AvailableChunks is how many chunks can still be reserved. It is computed,
@@ -123,18 +133,24 @@ type OfferFilter struct {
 	// OnlyFresh keeps only providers still within the freshness window.
 	//
 	// Note it is a flag and not a timestamp. A timestamp ("seen since T")
-	// would work in SQL but is impossible in Redis, where a key either
-	// exists or does not and cannot be searched by time. So the window
-	// itself belongs inside the implementation, chosen when the store is
-	// built: SQL compares LastSeen, Redis lets the key expire.
+	// would work in SQL but is impossible in Redis, which cannot search by
+	// time at all. So the window itself belongs inside the implementation,
+	// chosen when the store is built, and each backend answers the flag its
+	// own way.
+	//
+	// Not, however, by letting a key expire, which is the trick Redis
+	// invites. Expiry deletes, and going stale is not being deleted: a
+	// quiet provider must still be found by GetOffer and still appear in an
+	// unfiltered list. Every backend therefore keeps the entry and computes
+	// the answer from LastSeen when it is read.
 	OnlyFresh bool
 
 	// ClusterType keeps only offers of this type. Empty means any.
 	ClusterType string
 }
 
-// OfferStore is the catalog: the list of registered offers that consumers,
-// and later FiberCop, read.
+// OfferStore is the catalog side of the store: the list of registered offers
+// that consumers, and later FiberCop, read.
 type OfferStore interface {
 	// UpsertOffer records a provider's current offer and renews its
 	// freshness. It is called on every advertisement, so roughly every
@@ -155,5 +171,76 @@ type OfferStore interface {
 	ListOffers(ctx context.Context, f OfferFilter) ([]Offer, error)
 }
 
+// ChunkStore is the reservation side of the store: how many of a provider's
+// chunks are already taken.
+//
+// It is a second interface rather than more methods on OfferStore because the
+// two are read by different code. Everything that only answers "what is in
+// the catalog" needs OfferStore alone, and cannot accidentally change a
+// counter it has no business touching.
+//
+// Both methods are business operations, not generic reads and writes. That is
+// deliberate: the thing that must not break is that two consumers are never
+// sold the same chunk, and that is only guaranteed if deciding and recording
+// happen as one indivisible step inside the implementation. A generic
+// interface would have to expose a transaction, which Kubernetes cannot give
+// across objects and Redis cannot give as a query — so each backend keeps its
+// own way of being atomic:
+//
+//	SQL    UPDATE ... WHERE total - reserved >= n, one statement
+//	Redis  one Lua script, run atomically
+//	CR     read, check, write, retried when the object changed underneath
+type ChunkStore interface {
+	// TryConsumeChunks takes count chunks from a provider if that many are
+	// still available.
+	//
+	// Not enough capacity is an answer, not a failure: it returns ok false
+	// with the number actually available and no error, and writes nothing.
+	// A caller turns that into a refused reservation. err is for a store
+	// that could not be reached at all.
+	//
+	// On success, available is what is left after this call.
+	TryConsumeChunks(ctx context.Context, clusterID string, count int32) (ok bool, available int32, err error)
+
+	// ReleaseChunks gives count chunks back when a reservation ends.
+	//
+	// It never lets the counter go below zero, and releasing more than is
+	// held is not an error. A release that is retried after a timeout, or
+	// runs twice because two paths both think they own the cleanup, must
+	// not be able to wedge a provider — and a counter that went negative
+	// would make the provider look like it had more capacity than it owns,
+	// which is the one failure this whole interface exists to prevent.
+	ReleaseChunks(ctx context.Context, clusterID string, count int32) error
+}
+
+// Store is both sides at once. Every implementation provides both; the two
+// interfaces exist so callers can ask for only the half they need.
+type Store interface {
+	OfferStore
+	ChunkStore
+}
+
 // ErrNotFound is returned when the requested entry does not exist.
 var ErrNotFound = errors.New("store: not found")
+
+// ErrInvalidCount is returned when a caller asks to consume or release a
+// number of chunks that is not positive. It is rejected rather than quietly
+// treated as nothing to do, because a zero or negative count reaching this
+// layer means the caller computed it wrong, and silently succeeding would
+// hide that.
+var ErrInvalidCount = errors.New("store: chunk count must be positive")
+
+// ErrPartialWrite means the offer itself was stored, but its freshness stamp
+// was not. The offer is in the catalog; only "last seen" is older than it
+// should be, and the provider's next advertisement renews it.
+//
+// It names a state, not a backend: any store that writes the offer and its
+// timestamp in two steps can report it, and one that writes both at once
+// never will. A caller that treats a missed stamp as harmless can log it and
+// carry on; one that does not can fail.
+var ErrPartialWrite = errors.New("store: offer stored, freshness not updated")
+
+// DefaultFreshFor is how long an offer counts as fresh when the caller does
+// not say otherwise. It mirrors the ninety seconds the advertisement
+// controller has always used to decide a provider is gone.
+const DefaultFreshFor = 90 * time.Second
