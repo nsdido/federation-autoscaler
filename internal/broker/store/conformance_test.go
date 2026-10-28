@@ -360,6 +360,27 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		Expect(got.Extra).To(BeEmpty())
 	})
 
+	It("returns resources sorted by name, whatever order they arrived in", func() {
+		// One backend keeps resources in a map and cannot preserve an
+		// insertion order, so the order has to be defined by the contract
+		// or it differs between backends — and between two reads of the
+		// same backend.
+		o := sampleOffer("cluster-a")
+		o.Resources = []Resource{
+			{Name: "nvidia.com/gpu", Allocatable: "2"},
+			{Name: "memory", Allocatable: "16Gi"},
+			{Name: "cpu", Allocatable: "8"},
+		}
+
+		stored, err := s.UpsertOffer(ctx, o)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(names(stored.Resources)).To(Equal([]string{"cpu", "memory", "nvidia.com/gpu"}))
+
+		got, err := s.GetOffer(ctx, "cluster-a")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(names(got.Resources)).To(Equal([]string{"cpu", "memory", "nvidia.com/gpu"}))
+	})
+
 	It("filters by cluster type", func() {
 		std := sampleOffer("cluster-a")
 		gpu := sampleOffer("cluster-b")
@@ -403,6 +424,15 @@ func RunOfferStoreConformance(newStore func(freshFor time.Duration) OfferStore) 
 		Expect(again.Resources[0].Name).To(Equal("cpu"))
 		Expect(*again.CarbonIntensity).To(BeNumerically("==", 120))
 	})
+}
+
+// names lists resource names in the order the store returned them.
+func names(rs []Resource) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.Name)
+	}
+	return out
 }
 
 // sampleOffer is a complete, valid offer used across the specs.

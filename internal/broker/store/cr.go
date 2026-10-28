@@ -418,6 +418,10 @@ func resourcesFromCR(spec brokerv1alpha1.ClusterAdvertisementSpec) []Resource {
 		}
 		out = append(out, r)
 	}
+
+	// The map above has no order of its own, so without this the same
+	// advertisement comes back differently from one read to the next.
+	SortResources(out)
 	return out
 }
 

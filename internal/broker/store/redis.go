@@ -114,6 +114,7 @@ func (s *RedisStore) UpsertOffer(ctx context.Context, o Offer) (Offer, error) {
 	}
 
 	stored := cloneOffer(o)
+	SortResources(stored.Resources)
 	stored.LastSeen = seen
 	stored.Fresh = true
 	stored.ReservedChunks = parseCount(res)
@@ -312,6 +313,7 @@ func (s *RedisStore) offerFromHash(h map[string]string) (Offer, error) {
 		return Offer{}, fmt.Errorf("store: decode offer: %w", err)
 	}
 
+	SortResources(o.Resources)
 	o.TotalChunks = parseCount(h["total"])
 	o.ReservedChunks = parseCount(h["reserved"])
 

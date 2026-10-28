@@ -28,6 +28,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -42,7 +43,16 @@ type Offer struct {
 
 	// Topology carries its own HasLocation flag, so it is a value: an empty
 	// Topology means nothing is known about where this provider is.
-	Topology  Topology
+	Topology Topology
+
+	// Resources is always returned sorted by Name. The order is part of
+	// the contract rather than a detail each backend decides, because one
+	// of them cannot keep an insertion order at all: the custom resource
+	// holds resources in a map, and Go iterates a map in a random order.
+	// Left unspecified, the same offer would come back in a different
+	// order on different backends, and on the same backend between two
+	// reads — which is the worst kind of difference, because code written
+	// against one of them passes its tests and fails in production.
 	Resources []Resource
 
 	ProbeEndpoint string
@@ -218,6 +228,12 @@ type ChunkStore interface {
 type Store interface {
 	OfferStore
 	ChunkStore
+}
+
+// SortResources puts resources in the order every store returns them:
+// by name. Implementations call it before handing an Offer back.
+func SortResources(rs []Resource) {
+	sort.Slice(rs, func(i, j int) bool { return rs[i].Name < rs[j].Name })
 }
 
 // ErrNotFound is returned when the requested entry does not exist.

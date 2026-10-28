@@ -53,6 +53,7 @@ func (m *MemoryStore) UpsertOffer(_ context.Context, o Offer) (Offer, error) {
 	defer m.mu.Unlock()
 
 	stored := cloneOffer(o)
+	SortResources(stored.Resources)
 	stored.LastSeen = m.now()
 	stored.Fresh = false // never stored; computed on read
 
