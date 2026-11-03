@@ -40,7 +40,8 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	freshFor := flag.Duration("fresh-for", store.DefaultFreshFor, "how long an offer counts as fresh after its last publish")
+	freshFor := flag.Duration("fresh-for", store.DefaultFreshFor,
+		"how long an offer counts as fresh after its last publish")
 	redisAddr := flag.String("redis", "", "Redis address; empty keeps offers in memory only")
 	flag.Parse()
 
