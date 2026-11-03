@@ -42,6 +42,7 @@ import (
 	autoscalingv1alpha1 "github.com/netgroup-polito/federation-autoscaler/api/autoscaling/v1alpha1"
 	brokerv1alpha1 "github.com/netgroup-polito/federation-autoscaler/api/broker/v1alpha1"
 	brokerapi "github.com/netgroup-polito/federation-autoscaler/internal/broker/api"
+	"github.com/netgroup-polito/federation-autoscaler/internal/broker/store"
 	autoscalingcontroller "github.com/netgroup-polito/federation-autoscaler/internal/controller/autoscaling"
 	brokercontroller "github.com/netgroup-polito/federation-autoscaler/internal/controller/broker"
 	fedmanager "github.com/netgroup-polito/federation-autoscaler/internal/manager"
@@ -155,6 +156,7 @@ func main() {
 		Client:             mgr.GetClient(),
 		Namespace:          apiNamespace,
 		ReservationTimeout: reservationTimeout,
+		Store:              store.NewMemoryStore(store.DefaultFreshFor),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to build broker api server")
