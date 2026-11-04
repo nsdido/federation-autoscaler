@@ -81,7 +81,8 @@ func (rr *realRedis) wipe() {
 // login creates a Redis account with the given ACL rules and returns a client
 // connected as that account. The account is deleted when the spec ends.
 func (rr *realRedis) login(user string, rules ...string) *redis.Client {
-	args := []any{"ACL", "SETUSER", user, "reset", "on", ">" + aclTestPassword}
+	args := make([]any, 0, 6+len(rules))
+	args = append(args, "ACL", "SETUSER", user, "reset", "on", ">"+aclTestPassword)
 	for _, r := range rules {
 		args = append(args, r)
 	}
