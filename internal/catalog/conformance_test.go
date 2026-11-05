@@ -19,6 +19,7 @@ package catalog
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -218,6 +219,15 @@ func RunCatalogConformance(newBackend func() conformanceBackend) {
 		{"an empty site", "fibercop", ""},
 		{"a colon in the provider", "fiber:cop", "asti"},
 		{"a colon in the site", "fibercop", "as:ti"},
+		{"a star in the provider", "p*", "asti"},
+		{"a question mark in the provider", "p?", "asti"},
+		{"brackets in the provider", "p[1]", "asti"},
+		{"an uppercase provider", "P1", "asti"},
+		{"a leading dash in the provider", "-p1", "asti"},
+		{"a 64-character provider", strings.Repeat("a", 64), "asti"},
+		{"a star in the site", "fibercop", "as*"},
+		{"an uppercase site", "fibercop", "Asti"},
+		{"a 64-character site", "fibercop", strings.Repeat("a", 64)},
 	} {
 		It("rejects "+k.name, func() {
 			// The Redis key is catalog:offer:<provider>:<site>. A colon would
@@ -227,6 +237,15 @@ func RunCatalogConformance(newBackend func() conformanceBackend) {
 
 			err = b.w.DeleteOffer(ctx, k.provider, k.site)
 			Expect(err).To(MatchError(ErrInvalidOffer))
+		})
+	}
+	for _, v := range []struct{ provider, site string }{
+		{"p1", "default"},
+		{"crownlabs-polito", "asti"},
+		{"fibercop", "default"},
+	} {
+		It("accepts "+v.provider+"/"+v.site, func() {
+			Expect(b.w.UpsertOffer(ctx, sampleOffer(v.provider, v.site))).To(Succeed())
 		})
 	}
 
