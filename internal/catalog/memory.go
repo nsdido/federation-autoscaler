@@ -119,7 +119,14 @@ func (m *MemoryCatalog) GetOffer(ctx context.Context, providerID, siteID string)
 	if !ok || !now.Before(e.expiresAt) {
 		return Offer{}, ErrNotFound
 	}
-	return decodeOffer(e.data)
+	o, err := decodeOffer(e.data)
+	if err != nil {
+		return Offer{}, err
+	}
+	if o.ProviderID != providerID || o.SiteID != siteID {
+		return Offer{}, ErrNotFound
+	}
+	return o, nil
 }
 
 // ListOffers returns all live offers, in no particular order.
@@ -129,19 +136,26 @@ func (m *MemoryCatalog) ListOffers(ctx context.Context) ([]Offer, error) {
 	}
 	m.mu.RLock()
 	now := m.now()
-	raw := make([][]byte, 0, len(m.entries))
-	for _, e := range m.entries {
+	type stored struct {
+		key  memoryKey
+		data []byte
+	}
+	raw := make([]stored, 0, len(m.entries))
+	for k, e := range m.entries {
 		if now.Before(e.expiresAt) {
-			raw = append(raw, e.data)
+			raw = append(raw, stored{k, e.data})
 		}
 	}
 	m.mu.RUnlock()
 
 	offers := make([]Offer, 0, len(raw))
-	for _, data := range raw {
-		o, err := decodeOffer(data)
+	for _, s := range raw {
+		o, err := decodeOffer(s.data)
 		if err != nil {
 			return nil, err
+		}
+		if (memoryKey{o.ProviderID, o.SiteID}) != s.key {
+			continue
 		}
 		offers = append(offers, o)
 	}

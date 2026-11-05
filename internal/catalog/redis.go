@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -68,6 +69,20 @@ func redisKey(providerID, siteID string) string {
 	return redisKeyPrefix + providerID + ":" + siteID
 }
 
+// parseRedisKey splits a catalog key into its two IDs. ok is false when the
+// key does not have the catalog format or its IDs fail validateKey.
+func parseRedisKey(key string) (providerID, siteID string, ok bool) {
+	rest, found := strings.CutPrefix(key, redisKeyPrefix)
+	if !found {
+		return "", "", false
+	}
+	providerID, siteID, found = strings.Cut(rest, ":")
+	if !found || validateKey(providerID, siteID) != nil {
+		return "", "", false
+	}
+	return providerID, siteID, true
+}
+
 // UpsertOffer stores the offer and its expiry in a single SET ... EX command,
 // so there is no moment where the offer exists without an expiry.
 func (c *RedisCatalog) UpsertOffer(ctx context.Context, o Offer) error {
@@ -105,7 +120,14 @@ func (c *RedisCatalog) GetOffer(ctx context.Context, providerID, siteID string) 
 	if err != nil {
 		return Offer{}, fmt.Errorf("catalog: read offer: %w", err)
 	}
-	return decodeOffer(data)
+	o, err := decodeOffer(data)
+	if err != nil {
+		return Offer{}, err
+	}
+	if o.ProviderID != providerID || o.SiteID != siteID {
+		return Offer{}, ErrNotFound
+	}
+	return o, nil
 }
 
 // ListOffers returns all live offers, in no particular order.
@@ -136,14 +158,21 @@ func (c *RedisCatalog) ListOffers(ctx context.Context) ([]Offer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("catalog: read offers: %w", err)
 	}
-	for _, v := range values {
+	for i, v := range values {
 		s, ok := v.(string)
 		if !ok {
 			continue // nil: the offer expired between SCAN and MGET
 		}
+		providerID, siteID, ok := parseRedisKey(keys[i])
+		if !ok {
+			continue
+		}
 		o, err := decodeOffer([]byte(s))
 		if err != nil {
 			return nil, err
+		}
+		if o.ProviderID != providerID || o.SiteID != siteID {
+			continue
 		}
 		offers = append(offers, o)
 	}

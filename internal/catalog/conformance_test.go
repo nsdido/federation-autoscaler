@@ -249,6 +249,30 @@ func RunCatalogConformance(newBackend func() conformanceBackend) {
 		})
 	}
 
+	It("skips an offer whose content disagrees with its key", func() {
+		Expect(b.w.UpsertOffer(ctx, sampleOffer("fibercop", "asti"))).To(Succeed())
+
+		// Stored under fibercop/cuneo, but the content says another provider.
+		otherProvider, err := json.Marshal(sampleOffer("acme", "cuneo"))
+		Expect(err).NotTo(HaveOccurred())
+		b.putRaw("fibercop", "cuneo", otherProvider)
+
+		// Stored under fibercop/alba, but the content says another site.
+		otherSite, err := json.Marshal(sampleOffer("fibercop", "default"))
+		Expect(err).NotTo(HaveOccurred())
+		b.putRaw("fibercop", "alba", otherSite)
+
+		_, err = b.r.GetOffer(ctx, "fibercop", "cuneo")
+		Expect(err).To(MatchError(ErrNotFound))
+		_, err = b.r.GetOffer(ctx, "fibercop", "alba")
+		Expect(err).To(MatchError(ErrNotFound))
+
+		all, err := b.r.ListOffers(ctx)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(all).To(HaveLen(1))
+		Expect(all[0].ProviderID).To(Equal("fibercop"))
+		Expect(all[0].SiteID).To(Equal("asti"))
+	})
 	// -----------------------------------------------------------------------
 	// isolation
 	// -----------------------------------------------------------------------
