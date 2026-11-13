@@ -20,12 +20,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // ErrInvalidOffer is returned when an offer cannot be stored because its key
-// is not valid. Use errors.Is(err, ErrInvalidOffer) to test for it.
+// or its TTL is not valid. Use errors.Is(err, ErrInvalidOffer) to test for it.
 var ErrInvalidOffer = errors.New("catalog: invalid offer")
 
 // validateKey checks that providerID and siteID are safe to embed in a
@@ -44,4 +45,24 @@ func validateKey(providerID, siteID string) error {
 		}
 	}
 	return nil
+}
+
+// MinTTLSeconds and MaxTTLSeconds bound Offer.TTLSeconds.
+const (
+	MinTTLSeconds = 30
+	MaxTTLSeconds = 3600
+)
+
+// offerTTL returns how long the offer lives without a refresh: OfferTTL when
+// TTLSeconds is 0, else TTLSeconds. A value outside
+// [MinTTLSeconds, MaxTTLSeconds] is rejected with ErrInvalidOffer.
+func offerTTL(o Offer) (time.Duration, error) {
+	if o.TTLSeconds == 0 {
+		return OfferTTL, nil
+	}
+	if o.TTLSeconds < MinTTLSeconds || o.TTLSeconds > MaxTTLSeconds {
+		return 0, fmt.Errorf("%w: ttlSeconds %d is outside %d..%d",
+			ErrInvalidOffer, o.TTLSeconds, MinTTLSeconds, MaxTTLSeconds)
+	}
+	return time.Duration(o.TTLSeconds) * time.Second, nil
 }
